@@ -1,52 +1,44 @@
-FROM crystallang/crystal:1.16.3-alpine AS builder
+import yt_dlp
+from flask import Flask, request, jsonify
+import os
 
-RUN apk add --no-cache sqlite-static yaml-static
+app = Flask(__name__)
 
-ARG release
+# --- الإعدادات النهائية والقوية (كوكيز + محاكاة أندرويد) ---
+cookies_file_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
-WORKDIR /invidious
-COPY ./shard.yml ./shard.yml
-COPY ./shard.lock ./shard.lock
-RUN shards install --production
+YDL_OPTIONS = {
+    'format': 'bestvideo+bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'cookiefile': cookies_file_path,
+    'nocheckcertificate': True,
+    
+    # محاكاة عميل أندرويد لتجنب الحظر
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web_embedded']
+        }
+    }
+}
+# --- نهاية التعديل ---
 
-COPY ./src/ ./src/
-# TODO: .git folder is required for building – this is destructive.
-# See definition of CURRENT_BRANCH, CURRENT_COMMIT and CURRENT_VERSION.
-#COPY ./.git/ ./.git/
+@app.route('/api/info')
+def get_info():
+    video_url = request.args.get('url')
+    if not video_url:
+        return jsonify({"error": "الرجاء توفير رابط الفيديو"}), 400
 
-# Required for fetching player dependencies
-COPY ./scripts/ ./scripts/
-COPY ./assets/ ./assets/
-COPY ./videojs-dependencies.yml ./videojs-dependencies.yml
+    if not os.path.exists(cookies_file_path):
+        return jsonify({"error": "ملف الكوكيز 'cookies.txt' غير موجود"}), 500
 
-RUN crystal spec --warnings all \
-    --link-flags "-lxml2 -llzma"    
-RUN --mount=type=cache,target=/root/.cache/crystal if [[ "${release}" == 1 ]] ; then \
-        crystal build ./src/invidious.cr \
-        --release \
-        --static --warnings all \
-        --link-flags "-lxml2 -llzma"; \
-    else \
-        crystal build ./src/invidious.cr \
-        --static --warnings all \
-        --link-flags "-lxml2 -llzma"; \
-    fi
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            sanitized_info = ydl.sanitize_info(info)
+            return jsonify(sanitized_info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-FROM alpine:3.21
-RUN apk add --no-cache rsvg-convert ttf-opensans tini tzdata
-WORKDIR /invidious
-RUN addgroup -g 1000 -S invidious && \
-    adduser -u 1000 -S invidious -G invidious
-COPY --chown=invidious ./config/config.* ./config/
-RUN mv -n config/config.example.yml config/config.yml
-RUN sed -i 's/host: \(127.0.0.1\|localhost\)/host: invidious-db/' config/config.yml
-COPY ./config/sql/ ./config/sql/
-COPY ./locales/ ./locales/
-COPY --from=builder /invidious/assets ./assets/
-COPY --from=builder /invidious/invidious .
-RUN chmod o+rX -R ./assets ./config ./locales
-
-EXPOSE 3000
-USER invidious
-ENTRYPOINT ["/sbin/tini", "--"]
-CMD [ "/invidious/invidious" ]
+if __name__ == "__main__":
+    app.run()
